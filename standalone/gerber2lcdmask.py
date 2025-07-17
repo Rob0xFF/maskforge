@@ -5,7 +5,9 @@ from PyQt5.QtWidgets import (
     QLineEdit, QGroupBox, QGridLayout, QSizePolicy, QFrame, QGraphicsView,
     QGraphicsScene
 )
-from PyQt5.QtCore import Qt, QCoreApplication, QSettings
+from PyQt5.QtCore import (
+    Qt, QCoreApplication, QSettings, QObject, QThread, pyqtSignal
+)
 from PyQt5.QtGui import QPixmap, QPainter, QColor
 from PIL import Image, ImageOps
 
@@ -19,8 +21,8 @@ from pygerber.common.rgba import RGBA
 # App identity / settings
 # ------------------------------------------------------------------
 COMPANY_NAME = "Rob0xFF"
-APP_NAME_SETTINGS = "Gerber LCD Photomask"   # ASCII-safe name for settings storage
-WINDOW_TITLE_DISPLAY = "Gerber \u2192 LCD Photomask"  # nice arrow in window title
+APP_NAME_SETTINGS = "Gerber LCD Photomask"   # ASCII-safe name for QSettings
+WINDOW_TITLE_DISPLAY = "Gerber \u2192 LCD Photomask"  # display title
 
 
 # ------------------------------------------------------------------
@@ -66,8 +68,7 @@ binary_scheme = ColorScheme(
 
 
 # ------------------------------------------------------------------
-# Rendering helpers
-# (PNG-Erzeugung unverändert: LANCZOS-Resampling, kein Threshold; Invert-Bugfix.)
+# Rendering helpers (PNG-Erzeugung unverändert: LANCZOS, Invert-Bugfix)
 # ------------------------------------------------------------------
 def render_bw_with_origin(path: str):
     parsed = GerberFile.from_file(path).parse()
@@ -115,14 +116,40 @@ def build_canvas(img: Image.Image, invert: bool, mirror: bool, min_x_mm, max_y_m
 
 
 # ------------------------------------------------------------------
+# Worker thread to offload heavy Prepare work
+# ------------------------------------------------------------------
+class PrepareWorker(QObject):
+    finished = pyqtSignal(Image.Image, float, float, float, float)  # pil_img, min_x, max_y, w, h
+    error = pyqtSignal(str)
+
+    def __init__(self, gerber_path: str, invert: bool, mirror: bool):
+        super().__init__()
+        self.gerber_path = gerber_path
+        self.invert = invert
+        self.mirror = mirror
+
+    def run(self):
+        try:
+            img0, min_x, max_y, w, h = render_bw_with_origin(self.gerber_path)
+            canvas_img = build_canvas(
+                img0, self.invert, self.mirror, min_x, max_y, w, h
+            )
+        except Exception as e:
+            self.error.emit(str(e))
+            return
+
+        self.finished.emit(canvas_img, min_x, max_y, w, h)
+
+
+# ------------------------------------------------------------------
 # Interactive Preview View (hard-pixel display; no smoothing)
 # ------------------------------------------------------------------
 class PreviewView(QGraphicsView):
     """
     Mouse-wheel zoomable preview.
     - Wheel: zoom in/out around cursor
-    - Drag: pan (hold left mouse; ScrollHandDrag)
-    - Double-click: fit image to view
+    - Drag: pan
+    - Double-click: fit
     Hard pixels: SmoothPixmapTransform disabled.
     """
     def __init__(self, width: int, height: int, parent=None):
@@ -138,22 +165,19 @@ class PreviewView(QGraphicsView):
 
         self._pixmap_item = None
         self._placeholder_pixmap = self._make_placeholder_pixmap()
-
         self._set_pixmap(self._placeholder_pixmap, fit=False)
 
-        # Interaction behavior
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setInteractive(True)
-        self.setTransformationAnchor(QGraphicsView.NoAnchor)  # we handle anchor manually
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
 
-        # **No smoothing** when scaling pixmaps
         self.setRenderHint(QPainter.SmoothPixmapTransform, False)
         self.setRenderHint(QPainter.Antialiasing, False)
 
-        # zoom constraints
-        self._min_scale = 0.01
-        self._max_scale = 100.0
+        # ---- Updated zoom limits ----
+        self._min_scale = 0.05
+        self._max_scale = 10.0
 
     def _make_placeholder_pixmap(self) -> QPixmap:
         pix = QPixmap(self._w, self._h)
@@ -171,7 +195,6 @@ class PreviewView(QGraphicsView):
         self._set_pixmap(self._placeholder_pixmap, fit=False)
 
     def set_image_pixmap(self, pixmap: QPixmap):
-        """Replace current pixmap with given one and fit to view."""
         self._set_pixmap(pixmap, fit=True)
 
     def _set_pixmap(self, pixmap: QPixmap, fit: bool):
@@ -186,32 +209,23 @@ class PreviewView(QGraphicsView):
         if self._pixmap_item is None:
             super().wheelEvent(event)
             return
-
         old_pos = self.mapToScene(event.pos())
         angle = event.angleDelta().y()
         if angle == 0:
             return
-
-        # zoom step
         factor = 1.25 if angle > 0 else 0.8
-
-        # clamp
-        cur_scale = self.transform().m11()  # assume uniform
+        cur_scale = self.transform().m11()
         new_scale = cur_scale * factor
         if new_scale < self._min_scale:
             factor = self._min_scale / cur_scale
         elif new_scale > self._max_scale:
             factor = self._max_scale / cur_scale
-
         self.scale(factor, factor)
-
-        # keep cursor focus
         new_pos = self.mapToScene(event.pos())
         delta = new_pos - old_pos
         self.translate(delta.x(), delta.y())
 
     def mouseDoubleClickEvent(self, event):
-        # fit-to-view reset
         if self._pixmap_item is not None:
             self.resetTransform()
             self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
@@ -222,9 +236,13 @@ class PreviewView(QGraphicsView):
 # Main GUI
 # ------------------------------------------------------------------
 class MainGUI(QMainWindow):
-    FIELD_WIDTH = 150  # uniform width for numeric fields
+    FIELD_WIDTH = 150
     PREVIEW_W = 800
     PREVIEW_H = 600
+
+    COLOR_OK = "#4caf50"
+    COLOR_ERR = "#f44336"
+    COLOR_BUSY = "#2196f3"
 
     def __init__(self):
         super().__init__()
@@ -233,21 +251,27 @@ class MainGUI(QMainWindow):
         # QSettings
         self.settings = QSettings(COMPANY_NAME, APP_NAME_SETTINGS)
 
-        # Status label
-        self.status_label = QLabel("Ready.")
+        # runtime state
+        self.image = None
+        self.min_x = self.max_y = self.width = self.height = None
+        self.gerber_path = None
+
+        # thread refs
+        self._prepare_thread = None
+        self._prepare_worker = None
 
         # ------------------------------------------------------------------
         # Files group
         # ------------------------------------------------------------------
         self.gerber_edit = QLineEdit()
         self.gerber_edit.setPlaceholderText("Select Gerber file…")
-        gerber_browse_btn = QPushButton("Browse...")
-        gerber_browse_btn.clicked.connect(self.browse_gerber)
+        self.gerber_browse_btn = QPushButton("Browse...")
+        self.gerber_browse_btn.clicked.connect(self.browse_gerber)
 
         self.png_edit = QLineEdit()
         self.png_edit.setPlaceholderText("Select output PNG…")
-        png_browse_btn = QPushButton("Browse...")
-        png_browse_btn.clicked.connect(self.browse_png)
+        self.png_browse_btn = QPushButton("Browse...")
+        self.png_browse_btn.clicked.connect(self.browse_png)
 
         files_grid = QGridLayout()
         lbl_gerber = QLabel("Gerber:")
@@ -257,11 +281,11 @@ class MainGUI(QMainWindow):
 
         files_grid.addWidget(lbl_gerber, 0, 0)
         files_grid.addWidget(self.gerber_edit, 0, 1)
-        files_grid.addWidget(gerber_browse_btn, 0, 2)
+        files_grid.addWidget(self.gerber_browse_btn, 0, 2)
 
         files_grid.addWidget(lbl_png, 1, 0)
         files_grid.addWidget(self.png_edit, 1, 1)
-        files_grid.addWidget(png_browse_btn, 1, 2)
+        files_grid.addWidget(self.png_browse_btn, 1, 2)
 
         files_grid.setColumnStretch(0, 0)
         files_grid.setColumnStretch(1, 1)
@@ -273,42 +297,12 @@ class MainGUI(QMainWindow):
         # ------------------------------------------------------------------
         # Settings group
         # ------------------------------------------------------------------
-        # Display pixel resolution
-        self.sb_disp_px_w = QSpinBox()
-        self.sb_disp_px_w.setRange(1, 200000)
-        self.sb_disp_px_w.setAlignment(Qt.AlignRight)
-        self.sb_disp_px_w.setFixedWidth(self.FIELD_WIDTH)
-
-        self.sb_disp_px_h = QSpinBox()
-        self.sb_disp_px_h.setRange(1, 200000)
-        self.sb_disp_px_h.setAlignment(Qt.AlignRight)
-        self.sb_disp_px_h.setFixedWidth(self.FIELD_WIDTH)
-
-        # Physical display size (mm)
-        self.sb_disp_w_mm = QDoubleSpinBox()
-        self.sb_disp_w_mm.setDecimals(3)
-        self.sb_disp_w_mm.setRange(0.001, 10000)
-        self.sb_disp_w_mm.setAlignment(Qt.AlignRight)
-        self.sb_disp_w_mm.setFixedWidth(self.FIELD_WIDTH)
-
-        self.sb_disp_h_mm = QDoubleSpinBox()
-        self.sb_disp_h_mm.setDecimals(3)
-        self.sb_disp_h_mm.setRange(0.001, 10000)
-        self.sb_disp_h_mm.setAlignment(Qt.AlignRight)
-        self.sb_disp_h_mm.setFixedWidth(self.FIELD_WIDTH)
-
-        # PCB size (mm)
-        self.sb_pcb_w_mm = QDoubleSpinBox()
-        self.sb_pcb_w_mm.setDecimals(3)
-        self.sb_pcb_w_mm.setRange(0.001, 10000)
-        self.sb_pcb_w_mm.setAlignment(Qt.AlignRight)
-        self.sb_pcb_w_mm.setFixedWidth(self.FIELD_WIDTH)
-
-        self.sb_pcb_h_mm = QDoubleSpinBox()
-        self.sb_pcb_h_mm.setDecimals(3)
-        self.sb_pcb_h_mm.setRange(0.001, 10000)
-        self.sb_pcb_h_mm.setAlignment(Qt.AlignRight)
-        self.sb_pcb_h_mm.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_disp_px_w = QSpinBox(); self.sb_disp_px_w.setRange(1, 200000); self.sb_disp_px_w.setAlignment(Qt.AlignRight); self.sb_disp_px_w.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_disp_px_h = QSpinBox(); self.sb_disp_px_h.setRange(1, 200000); self.sb_disp_px_h.setAlignment(Qt.AlignRight); self.sb_disp_px_h.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_disp_w_mm = QDoubleSpinBox(); self.sb_disp_w_mm.setDecimals(3); self.sb_disp_w_mm.setRange(0.001, 10000); self.sb_disp_w_mm.setAlignment(Qt.AlignRight); self.sb_disp_w_mm.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_disp_h_mm = QDoubleSpinBox(); self.sb_disp_h_mm.setDecimals(3); self.sb_disp_h_mm.setRange(0.001, 10000); self.sb_disp_h_mm.setAlignment(Qt.AlignRight); self.sb_disp_h_mm.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_pcb_w_mm  = QDoubleSpinBox(); self.sb_pcb_w_mm.setDecimals(3);  self.sb_pcb_w_mm.setRange(0.001, 10000);  self.sb_pcb_w_mm.setAlignment(Qt.AlignRight); self.sb_pcb_w_mm.setFixedWidth(self.FIELD_WIDTH)
+        self.sb_pcb_h_mm  = QDoubleSpinBox(); self.sb_pcb_h_mm.setDecimals(3);  self.sb_pcb_h_mm.setRange(0.001, 10000);  self.sb_pcb_h_mm.setAlignment(Qt.AlignRight); self.sb_pcb_h_mm.setFixedWidth(self.FIELD_WIDTH)
 
         self.chk_inv = QCheckBox("Invert")
         self.chk_mir = QCheckBox("Mirror (top layer)")
@@ -327,7 +321,6 @@ class MainGUI(QMainWindow):
         settings_grid.setColumnStretch(1, 1)
         settings_grid.setColumnStretch(2, 0)
 
-        # Checkboxes row
         chk_row = QHBoxLayout()
         chk_row.addWidget(self.chk_inv)
         chk_row.addWidget(self.chk_mir)
@@ -341,15 +334,12 @@ class MainGUI(QMainWindow):
         settings_group.setLayout(settings_vlayout)
 
         # ------------------------------------------------------------------
-        # Action buttons (equal width)
+        # Action buttons
         # ------------------------------------------------------------------
         self.prepare_btn = QPushButton("Prepare Output")
-        self.save_btn = QPushButton("Save PNG")
-        self.save_btn.setEnabled(False)
-
+        self.save_btn = QPushButton("Save PNG"); self.save_btn.setEnabled(False)
         self.prepare_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.save_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
         self.prepare_btn.clicked.connect(self.prepare_output)
         self.save_btn.clicked.connect(self.save_png)
 
@@ -358,29 +348,39 @@ class MainGUI(QMainWindow):
         buttons_row.addWidget(self.save_btn)
 
         # ------------------------------------------------------------------
+        # Status row with colored indicator (spacing reduced to 4px)
+        # ------------------------------------------------------------------
+        self.ind = QLabel()
+        self.ind.setFixedSize(10, 10)
+        self.ind.setStyleSheet("border-radius:5px;background:#4caf50;")  # init green
+
+        self.status_label = QLabel("")
+
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.ind)
+        status_row.addSpacing(4)  # was 6
+        status_row.addWidget(self.status_label, 1)
+        status_row.addStretch(0)
+
+        # ------------------------------------------------------------------
         # Left control panel
         # ------------------------------------------------------------------
         controls_layout = QVBoxLayout()
         controls_layout.addWidget(files_group)
         controls_layout.addWidget(settings_group)
         controls_layout.addLayout(buttons_row)
-        controls_layout.addWidget(self.status_label)
+        controls_layout.addLayout(status_row)
         controls_layout.addStretch(1)
-
-        controls_widget = QWidget()
-        controls_widget.setLayout(controls_layout)
+        controls_widget = QWidget(); controls_widget.setLayout(controls_layout)
 
         # ------------------------------------------------------------------
-        # Preview panel (right column) with zoomable view
+        # Preview panel (right column)
         # ------------------------------------------------------------------
         self.preview_view = PreviewView(self.PREVIEW_W, self.PREVIEW_H)
-
         preview_layout = QVBoxLayout()
         preview_layout.addWidget(self.preview_view, alignment=Qt.AlignTop | Qt.AlignLeft)
         preview_layout.addStretch(1)
-
-        preview_widget = QWidget()
-        preview_widget.setLayout(preview_layout)
+        preview_widget = QWidget(); preview_widget.setLayout(preview_layout)
 
         # ------------------------------------------------------------------
         # Main 2-column layout
@@ -388,18 +388,24 @@ class MainGUI(QMainWindow):
         main_hlayout = QHBoxLayout()
         main_hlayout.addWidget(controls_widget)
         main_hlayout.addWidget(preview_widget)
-
-        container = QWidget()
-        container.setLayout(main_hlayout)
+        container = QWidget(); container.setLayout(main_hlayout)
         self.setCentralWidget(container)
 
-        # runtime state
-        self.image = None
-        self.min_x = self.max_y = self.width = self.height = None
-        self.gerber_path = None
-
-        # load persisted settings *after* UI elements exist
+        # load settings and init status
         self.load_settings()
+        self._set_status("Ready.", "ok")
+
+    # ------------------------------------------------------------------
+    # Status helper
+    # ------------------------------------------------------------------
+    def _set_status(self, text: str, state: str):
+        color = self.COLOR_OK
+        if state in ("busy", "preparing"):
+            color = self.COLOR_BUSY
+        elif state in ("error", "err", "fail"):
+            color = self.COLOR_ERR
+        self.ind.setStyleSheet(f"border-radius:5px;background:{color};")
+        self.status_label.setText(text)
 
     # helper for consistent labels
     def _mk_label(self, text: str) -> QLabel:
@@ -407,11 +413,27 @@ class MainGUI(QMainWindow):
         lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         return lbl
 
+    # enable/disable all user input controls during busy work
+    def _set_controls_enabled(self, enabled: bool):
+        self.gerber_edit.setEnabled(enabled)
+        self.gerber_browse_btn.setEnabled(enabled)
+        self.png_edit.setEnabled(enabled)
+        self.png_browse_btn.setEnabled(enabled)
+        self.sb_disp_px_w.setEnabled(enabled)
+        self.sb_disp_px_h.setEnabled(enabled)
+        self.sb_disp_w_mm.setEnabled(enabled)
+        self.sb_disp_h_mm.setEnabled(enabled)
+        self.sb_pcb_w_mm.setEnabled(enabled)
+        self.sb_pcb_h_mm.setEnabled(enabled)
+        self.chk_inv.setEnabled(enabled)
+        self.chk_mir.setEnabled(enabled)
+        self.prepare_btn.setEnabled(enabled)
+        # save_btn separat
+
     # ------------------------------------------------------------------
     # QSettings load/save
     # ------------------------------------------------------------------
     def load_settings(self):
-        """Restore all user fields from QSettings."""
         gerber_path = self.settings.value("paths/gerber", "", type=str)
         png_path    = self.settings.value("paths/output_png", "", type=str)
         self.gerber_edit.setText(gerber_path)
@@ -440,22 +462,17 @@ class MainGUI(QMainWindow):
         self.apply_user_values(silent=True)
 
     def save_settings(self):
-        """Persist all user fields to QSettings."""
         self.settings.setValue("paths/gerber",     self.gerber_edit.text().strip())
         self.settings.setValue("paths/output_png", self.png_edit.text().strip())
-
         self.settings.setValue("display/pix_w", self.sb_disp_px_w.value())
         self.settings.setValue("display/pix_h", self.sb_disp_px_h.value())
         self.settings.setValue("display/mm_w",  self.sb_disp_w_mm.value())
         self.settings.setValue("display/mm_h",  self.sb_disp_h_mm.value())
-
         self.settings.setValue("pcb/mm_w", self.sb_pcb_w_mm.value())
         self.settings.setValue("pcb/mm_h", self.sb_pcb_h_mm.value())
-
         self.settings.setValue("options/invert", self.chk_inv.isChecked())
         self.settings.setValue("options/mirror", self.chk_mir.isChecked())
-
-        self.settings.sync()  # flush to disk
+        self.settings.sync()
 
     def closeEvent(self, event):
         self.save_settings()
@@ -471,7 +488,7 @@ class MainGUI(QMainWindow):
         if fn:
             self.gerber_edit.setText(fn)
             self.gerber_path = fn
-            self.status_label.setText("Gerber file selected (not processed yet).")
+            self._set_status("Gerber file selected (not processed yet).", "ok")
             self.save_settings()
 
     def browse_png(self):
@@ -482,7 +499,7 @@ class MainGUI(QMainWindow):
             if not fn.lower().endswith(".png"):
                 fn += ".png"
             self.png_edit.setText(fn)
-            self.status_label.setText("Output path set.")
+            self._set_status("Output path set.", "ok")
             self.save_settings()
 
     # ------------------------------------------------------------------
@@ -501,7 +518,7 @@ class MainGUI(QMainWindow):
                 raise ValueError("All values must be > 0.")
         except Exception as e:
             if not silent:
-                self.status_label.setText(f"⚠️ Invalid values: {e}")
+                self._set_status(f"Invalid values: {e}", "error")
             return False
 
         DISPLAY_PIX_W = px_w
@@ -513,70 +530,88 @@ class MainGUI(QMainWindow):
         recompute_scalars()
 
         if not silent:
-            self.status_label.setText(
+            self._set_status(
                 f"Settings applied: {DISPLAY_PIX_W}×{DISPLAY_PIX_H}px display; "
                 f"{DISPLAY_W_MM:.3f}×{DISPLAY_H_MM:.3f}mm; "
-                f"PCB {PCB_W_MM:.3f}×{PCB_H_MM:.3f}mm."
+                f"PCB {PCB_W_MM:.3f}×{PCB_H_MM:.3f}mm.",
+                "ok",
             )
         return True
 
     # ------------------------------------------------------------------
-    # Prepare Output (render + convert) with busy status
+    # Prepare Output (non-blocking via worker thread; no overlay)
     # ------------------------------------------------------------------
     def prepare_output(self):
+        if self._prepare_thread and self._prepare_thread.isRunning():
+            self._set_status("Already preparing…", "busy")
+            return
+
         gerber_path = self.gerber_edit.text().strip()
         if not gerber_path:
-            self.status_label.setText("⚠️ No Gerber file selected.")
+            self._set_status("No Gerber file selected.", "error")
             return
         if not os.path.isfile(gerber_path):
-            self.status_label.setText("⚠️ Gerber file not found.")
+            self._set_status("Gerber file not found.", "error")
             return
 
         if not self.apply_user_values():
             return
 
-        # show busy status & cursor
-        self.status_label.setText("Preparing…")
-        QApplication.processEvents()  # flush paint
+        # busy UI state
+        self._set_status("Preparing…", "busy")
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.prepare_btn.setEnabled(False)
+        self._set_controls_enabled(False)
         self.save_btn.setEnabled(False)
 
-        try:
-            img0, self.min_x, self.max_y, self.width, self.height = render_bw_with_origin(gerber_path)
-            self.image = build_canvas(
-                img0,
-                self.chk_inv.isChecked(),
-                self.chk_mir.isChecked(),
-                self.min_x,
-                self.max_y,
-                self.width,
-                self.height,
-            )
-        except Exception as e:
-            print("Render error:", e)
-            self.status_label.setText("❌ Render error (see console).")
-            self.save_btn.setEnabled(False)
-            self.preview_view.reset_placeholder()
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.prepare_btn.setEnabled(True)
+        # worker + thread
+        self._prepare_worker = PrepareWorker(
+            gerber_path=gerber_path,
+            invert=self.chk_inv.isChecked(),
+            mirror=self.chk_mir.isChecked(),
+        )
+        self._prepare_thread = QThread(self)
+        self._prepare_worker.moveToThread(self._prepare_thread)
 
-        # Suggest an output name if none given
-        if not self.png_edit.text().strip():
-            base = os.path.splitext(os.path.basename(gerber_path))[0] + ".png"
-            out_path = os.path.join(os.path.dirname(gerber_path), base)
+        self._prepare_thread.started.connect(self._prepare_worker.run)
+        self._prepare_worker.finished.connect(self._prepare_finished)
+        self._prepare_worker.error.connect(self._prepare_error)
+        self._prepare_worker.finished.connect(self._prepare_thread.quit)
+        self._prepare_worker.error.connect(self._prepare_thread.quit)
+        self._prepare_thread.finished.connect(self._prepare_worker.deleteLater)
+        self._prepare_thread.finished.connect(self._thread_cleanup)
+
+        self._prepare_thread.start()
+
+    def _thread_cleanup(self):
+        QApplication.restoreOverrideCursor()
+        self._set_controls_enabled(True)
+        self._prepare_thread = None
+        self._prepare_worker = None
+
+    def _prepare_error(self, msg: str):
+        print("Render error:", msg)
+        self._set_status("Render error (see console).", "error")
+        self.save_btn.setEnabled(False)
+        self.preview_view.reset_placeholder()
+
+    def _prepare_finished(self, pil_img: Image.Image, min_x, max_y, w, h):
+        # store state
+        self.image = pil_img
+        self.min_x, self.max_y, self.width, self.height = min_x, max_y, w, h
+
+        # suggest output name if none given
+        if not self.png_edit.text().strip() and self.gerber_edit.text().strip():
+            base = os.path.splitext(os.path.basename(self.gerber_edit.text().strip()))[0] + ".png"
+            out_path = os.path.join(os.path.dirname(self.gerber_edit.text().strip()), base)
             self.png_edit.setText(out_path)
 
-        # update preview with rendered image
+        # update preview
         pix = self._pil_to_qpixmap(self.image)
         self.preview_view.set_image_pixmap(pix)
 
-        self.status_label.setText("✅ Output prepared. Click 'Save PNG' to write file.")
+        self._set_status("Output prepared. Click 'Save PNG' to write file.", "ok")
         self.save_btn.setEnabled(True)
 
-        # persist current settings immediately
         self.save_settings()
 
     # ------------------------------------------------------------------
@@ -584,7 +619,7 @@ class MainGUI(QMainWindow):
     # ------------------------------------------------------------------
     def save_png(self):
         if self.image is None:
-            self.status_label.setText("⚠️ Nothing to save – click 'Prepare Output' first.")
+            self._set_status("Nothing to save – click 'Prepare Output' first.", "error")
             return
 
         fn = self.png_edit.text().strip()
@@ -602,17 +637,16 @@ class MainGUI(QMainWindow):
 
         try:
             self.image.save(fn, format="PNG")
-            self.status_label.setText(f"✅ Saved: {os.path.basename(fn)}")
+            self._set_status(f"Saved: {os.path.basename(fn)}", "ok")
             self.save_settings()
         except Exception as e:
             print("Save error:", e)
-            self.status_label.setText("❌ Save error (see console).")
+            self._set_status("Save error (see console).", "error")
 
     # ------------------------------------------------------------------
     # PIL → QPixmap helper
     # ------------------------------------------------------------------
     def _pil_to_qpixmap(self, pil_image: Image.Image) -> QPixmap:
-        """Convert PIL Image to QPixmap via in-memory PNG."""
         buf = io.BytesIO()
         pil_image.save(buf, format="PNG")
         data = buf.getvalue()
@@ -623,7 +657,6 @@ class MainGUI(QMainWindow):
 
 # ------------------------------------------------------------------
 def main():
-    # Set app identity for QSettings *before* creating MainGUI
     QCoreApplication.setOrganizationName(COMPANY_NAME)
     QCoreApplication.setApplicationName(APP_NAME_SETTINGS)
 
