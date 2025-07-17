@@ -249,8 +249,6 @@ Before generating masks, set the **Display Width / Height in pixels** and the **
 2. Enter the LCD’s native resolution in pixels.
 3. These values drive accurate px/mm scale factors used in all tabs.
 
-> **Note:** If your LCD controller scales the input (e.g., frame buffer vs panel resolution mismatch), use the *effective pixel grid actually displayed* — not just the nominal HDMI input mode.
-
 ---
 
 ### 2. Gerber Workflow
@@ -341,7 +339,6 @@ If you require native pixel blow‑up inspection, zoom in (mouse wheel up) until
 - **Use a virtualenv** to isolate exact dependency versions.
 - **SSD storage** helps with very large PNG export times at 13k × 5k.
 - **Memory**: Large intermediate arrays (especially GDS flatten + raster) can consume gigabytes; close other tabs if low on RAM.
-- For batch runs, consider headless API hooks (see Roadmap).
 
 ---
 
@@ -369,7 +366,6 @@ See PyInstaller + PyQt5 docs for platform‑specific bundling.
 
 ## Roadmap
 
--
 
 Have a request? Open an issue!
 
@@ -377,7 +373,6 @@ Have a request? Open an issue!
 
 ## Known Issues / Limitations
 
-- **pygerber required** for Gerber tab; if missing, Gerber rendering is disabled (error state shown).
 - Very large GDS layouts may take significant time to flatten. Consider pre‑flattening externally if performance is critical.
 - Output always monochrome (8‑bit grayscale). No direct multi‑level grayscale dithering.
 - Layer datatype is currently assumed `0` in the GDS flow (matches your original script). Expand as needed.
