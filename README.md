@@ -10,7 +10,7 @@
 
 The Photomask Toolkit ("Maskforge Toolkit") targets DIY PCB exposure rigs, LCD photolithography setups, and experimental micro‑fabrication workflows. It lets you load design data from multiple EDA/file formats, map it into a calibrated LCD display space (pixel + physical mm), preview at pixel fidelity, and export production‑ready 1‑bit style masks (grayscale images with binary content).
 
-> **Status:** Actively evolving / pre‑release. APIs and file formats may change. Feedback welcome!
+!(screenshot)[Screenshot.png]
 
 ---
 
