@@ -442,7 +442,7 @@ GPL
 
 ---
 
-## Integration with PCBTools & Custom Schablone
+## Integration with PCBTools & Custom Alignment Frame
 
 This project generates *raw* photomask PNGs that are dimensionally aligned to your LCD panel (pixel + mm). To actually project them:
 
@@ -450,10 +450,10 @@ This project generates *raw* photomask PNGs that are dimensionally aligned to yo
 2. **Launch [PCBTools]** (or your own compatible image injector) and load the generated PNG.
    - PCBTools is responsible for pushing the image to your LCD controller, applying any display‑specific formatting, tiling, or color depth conversion that your hardware requires.
    - If you are scripting, PCBTools can be called headless; see its docs.
-3. **Mount your custom alignment frame ("Schablone")** in place of the resin vat on your LCD printer / exposure station.
+3. **Mount your custom alignment frame** in place of the resin vat on your LCD printer / exposure station.
    - The Schablone is a rigid, screw‑down plate that registers your workpiece (PCB panel, wafer, photoresist slide) to the LCD pixel grid.
    - Ensure the mechanical offsets used to design the Schablone match the display geometry you entered in the Photomask Toolkit.
-4. **Expose**: With the workpiece secured under the Schablone, command PCBTools (or your control software) to display the injected PNG at native resolution, full screen, 1:1 pixels.
+4. **Expose**: With the workpiece secured under the alignment frame, command PCBTools (or your control software) to display the injected PNG at native resolution, full screen, 1:1 pixels.
 
 ### Alignment Tips
 
@@ -476,37 +476,4 @@ Include mm dimensions in the repo metadata (README / YAML), since binary pixel s
 
 ---
 
-
-
----
-
-## Integration with PCBTools & Custom LCD Fixture ("Schablone")
-
-This project generates **monochrome photomask PNGs** whose pixel geometry matches your calibrated LCD panel. To actually *use* these masks in a photolithography / PCB exposure workflow you need two additional pieces:
-
-### 1. PCBTools – Image Injection / Transfer
-
-PCBTools is used **after** you prepare a mask in the Photomask Toolkit. It handles the hardware‑specific side of things:
-
-- Uploading / streaming the PNG to your LCD controller or printer firmware.
-- Managing device handshakes, orientation quirks, and timing.
-- Sequencing multiple masks (soldermask, silkscreen, multi‑step processes) if needed.
-
-> **Workflow:** Export PNG in Photomask Toolkit → Open PCBTools → Load the PNG(s) → Inject / Send to device → Verify on LCD.
-
-If you have a custom automation script or a forked toolchain, the key is that your downstream process must display the PNG *pixel‑exact* at panel native resolution, with no additional scaling, color conversion, or gamma correction.
-
-### 2. Custom Mechanical Alignment Frame ("Schablone")
-
-Instead of the resin vat (in an SLA/DLP‑style printer) you mount a **custom machined alignment frame — referred to here as the *****Schablone***** (German for stencil/template)** — directly over the LCD. Its jobs:
-
-- Holds your substrate (PCB coupon, wafer fragment, chrome glass, photoresist sheet) flat and at the correct Z distance.
-- Provides registration holes / screws so the optical center of the display aligns with the design area you targeted in the Toolkit.
-- Blocks stray UV around the exposure field.
-
-**Mounting:** Remove the resin vat. Place the Schablone over the LCD. Screw it down using the same boss positions or a dedicated bracket. Ensure no bowing; uniform pressure.
-
-**Calibration Tip:** Use the Toolkit to generate a crosshair / grid test pattern PNG, inject via PCBTools, and physically shim the Schablone until the pattern lands where expected.
-
----
 
