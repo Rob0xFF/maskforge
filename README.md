@@ -107,7 +107,7 @@ Convert PCB copper/soldermask/etc. Gerber layer files into a calibrated LCD phot
 
 ### GDS Tab
 
-Render a **GDSII** layout cell from a selected **layer** into **two circular exposure regions**, left & right, with the right region automatically inverted.
+Render a **GDSII** layout cell from a selected **layer** into **two circular exposure regions suitable for 4 inch / 100mm silicon wafers**, left & right, with the right region automatically inverted.
 
 **User Controls:**
 
